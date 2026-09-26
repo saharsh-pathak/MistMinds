@@ -1,0 +1,27 @@
+# Node / Dependencies
+node_modules/
+dist/
+build/
+.cache/
+
+# Environment / Credentials
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+data/credentials/firebase-adminsdk-key.json
+firmware/esp32_aqi_node/secrets.h
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+.vscode/
+.idea/
+
+# Local build / python artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
