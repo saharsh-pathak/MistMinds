@@ -2,11 +2,9 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { LocationData, AQICategory, SprinklerStatus, SprinklerState } from './types';
 import { TEMP_AQI_LOCATIONS, NAQI_BREAKPOINTS, OFFICIAL_STATION_DATA, MAP_CENTER } from './constants';
-import { calculateAQI, getCategoryFromAQI, generateMockHistory, simulateNodeData, generateMockPredictions, simulateSprinklerImpact, subscribeToNode1, Node1FirebaseData, saveActivationToFirebase, fetchSprinklerHistory, calculatePM25FromAQI, pushSensorHistory } from './services/aqiService';
+import { calculateAQI, getCategoryFromAQI, generateMockHistory, simulateNodeData, simulateSprinklerImpact, subscribeToNode1, Node1FirebaseData, saveActivationToFirebase, fetchSprinklerHistory, calculatePM25FromAQI, pushSensorHistory } from './services/aqiService';
 import { shouldActivateSprinkler } from './services/controlService';
-import { fetchNodeHistory, predictNext30Minutes } from './services/predictionService';
 import AQIMap from './components/AQIMap';
-import PredictionModule from './components/PredictionModule';
 import SprinklerControl from './components/SprinklerControl';
 
 const App: React.FC = () => {
@@ -244,9 +242,8 @@ const App: React.FC = () => {
           const node1Base = { pm25: 85, pm10: 136, ...calculateAQI(85) };
 
           if (idx === 0) {
-            // Node 1 starts as NaN/disconnected until Firebase confirms live ESP data.
-            // The Firebase subscription (guarded) will overwrite this with real values.
-            nodeReading = { aqi: NaN, pm25: NaN, pm10: NaN, category: 'UNKNOWN' as AQICategory };
+            // Node 1 initial default reading; updated immediately if Firebase receives live data
+            nodeReading = { pm25: 85, pm10: 136, humidity: 55, temperature: 29.5, ...calculateAQI(85) };
           } else {
             // Simulate Nodes 2, 3, 4 as per User requested scenarios
             nodeReading = simulateNodeData(idx + 1);
@@ -267,7 +264,11 @@ const App: React.FC = () => {
         });
 
         setLocations(data);
-        if (data.length > 0) setSelectedId(data[0].id);
+        if (data.length > 0) {
+          // Default to first active node (e.g. node-2 if node-1 is awaiting live ESP connection)
+          const firstActive = data.find(l => !isNaN(l.currentReading.aqi));
+          setSelectedId(firstActive ? firstActive.id : data[0].id);
+        }
 
         // 3. Initialize zone last treated times from real history
         const initialZoneTimes: { [zoneId: string]: Date } = {};
@@ -287,43 +288,6 @@ const App: React.FC = () => {
     };
     initData();
   }, []);
-
-  // Sync AI Predictions with global locations state every 5 minutes
-  useEffect(() => {
-    const updatePredictions = async () => {
-      if (locations.length === 0) return;
-      console.log('🤖 Syncing AI Predictions with global state...');
-
-      const updatedLocations = await Promise.all(locations.map(async (loc) => {
-        if (loc.type !== 'TEMP_NODE') return loc;
-
-        try {
-          const dbPath = loc.id.startsWith('node-')
-            ? loc.id.replace('node-', 'Node')
-            : loc.id;
-
-          const history = await fetchNodeHistory(dbPath);
-          if (history.length > 0) {
-            const { predictions } = await predictNext30Minutes(history);
-            return {
-              ...loc,
-              predictions
-            };
-          }
-        } catch (e) {
-          console.warn(`⚠️ Failed to sync predictions for ${loc.id}:`, e);
-        }
-        return loc;
-      }));
-
-      setLocations(updatedLocations);
-    };
-
-    updatePredictions();
-    updatePredictions();
-    const interval = setInterval(updatePredictions, 5 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, [loading]); // Run after initial load
 
   const allLocations = useMemo(() => [officialStation, ...locations], [officialStation, locations]);
   const selectedLocation = useMemo(() => allLocations.find(l => l.id === selectedId), [allLocations, selectedId]);
@@ -507,21 +471,9 @@ const App: React.FC = () => {
     manualTimersRef.current[targetId] = timer;
   }, [locations, sprinklerStatus.activeNodes, colonyAverageHumidity, finalizeActivation, setSprinklerStatus, setZoneLastTreated]);
 
-  // Automatic Trigger Logic: Forecast-Aware Proactive Maintenance
-  // Checks both current AQI readings AND 30-min forecast peak to decide when to activate
-  const forecastPeakAQI = useMemo(() => {
-    if (locations.length === 0) return 0;
-    let peak = 0;
-    locations.filter(l => l.type === 'TEMP_NODE').forEach(loc => {
-      if (loc.predictions) {
-        loc.predictions.forEach(p => {
-          if (p.aqi > peak) peak = p.aqi;
-        });
-      }
-    });
-    return peak;
-  }, [locations]);
-
+  // Automatic Trigger Logic: Environmental Threshold Monitoring
+  // Checks current AQI readings and humidity to decide when to activate
+  const forecastPeakAQI = 0;
 
   // Stable 60s Monitoring Loop
   useEffect(() => {
@@ -532,24 +484,19 @@ const App: React.FC = () => {
         // Skip if already active in state
         if (sprinklerStatus.activeNodes[loc.id]) return;
 
-        // 🔌 MANUAL MODE GUARD: If this node is in manual mode, skip ALL prediction logic.
-        // Manual mode is completely decoupled from the ML forecast system.
+        // 🔌 MANUAL MODE GUARD: If this node is in manual mode, skip auto trigger.
         const isManualMode = !(sprinklerStatus.autoMode[loc.id] ?? true);
         if (isManualMode) {
-          console.log(`🖐️ [Manual Mode] Skipping ${loc.name} — prediction system offline for this node.`);
           return;
         }
 
         const currentAQI = loc.currentReading.aqi;
         const humidity = loc.currentReading.humidity || 0;
 
-        let forecastPeak = 0;
-        if (loc.predictions && loc.predictions.length > 0) {
-          forecastPeak = Math.max(...loc.predictions.map(p => p.aqi));
-        }
+        if (isNaN(currentAQI)) return;
 
         // Call the decoupled control service
-        const activationRecommended = shouldActivateSprinkler(currentAQI, forecastPeak, humidity);
+        const activationRecommended = shouldActivateSprinkler(currentAQI, currentAQI, humidity);
 
         if (activationRecommended) {
           const MAINTENANCE_COOLDOWN_MS = 20 * 60 * 1000;
@@ -557,7 +504,7 @@ const App: React.FC = () => {
           const isOnCooldown = lastTreated && (Date.now() - lastTreated.getTime() < MAINTENANCE_COOLDOWN_MS);
 
           if (!isOnCooldown) {
-            console.log(`🤖 [Control Service] Recommendation: ACTIVATE ${loc.name} (AQI: ${currentAQI}, Peak: ${forecastPeak}, Hum: ${humidity}%)`);
+            console.log(`🤖 [Control Service] Recommendation: ACTIVATE ${loc.name} (AQI: ${currentAQI}, Hum: ${humidity}%)`);
             handleTriggerSprinkler(loc.id, false);
           }
         }
@@ -570,31 +517,6 @@ const App: React.FC = () => {
       clearInterval(intervalId);
     };
   }, [zoneLastTreated, sprinklerStatus.activeNodes, handleTriggerSprinkler]); // Minimal stable deps
-
-  // 🤖 BACKGROUND HISTORY RECORDER
-  // Periodically saves Node 1-4 live data to Firebase history so the AI Forecast has data
-  useEffect(() => {
-    console.log('🤖 Starting 5-minute history recording loop for all nodes...');
-    const recordPoint = () => {
-      locationsRef.current.filter(l => l.type === 'TEMP_NODE').forEach(loc => {
-        const dbPath = loc.id.startsWith('node-')
-          ? loc.id.replace('node-', 'Node')
-          : loc.id;
-
-        pushSensorHistory(dbPath, {
-          aqi: loc.currentReading.aqi,
-          humidity: loc.currentReading.humidity ?? 50,
-          temperature: loc.currentReading.temperature ?? 25,
-          timestamp: Math.floor(Date.now() / 1000)
-        });
-      });
-    };
-
-    // Initial record and then every 5 minutes
-    recordPoint();
-    const interval = setInterval(recordPoint, 5 * 60 * 1000);
-    return () => clearInterval(interval);
-  }, []);
 
   const getAqiInfo = (category: AQICategory) => NAQI_BREAKPOINTS.find(b => b.category === category);
 
@@ -639,24 +561,25 @@ const App: React.FC = () => {
 
       <main className="max-w-7xl mx-auto px-4 py-10 md:px-8 space-y-10">
         {/* Node Selector Dropdown */}
-        <div className="flex justify-start">
-          <div className="relative inline-flex items-center gap-2 bg-white px-3 py-1.5 rounded-none border border-slate-200 shadow-sm">
+        <div className="flex items-center gap-3">
+          <div className="relative inline-flex items-center gap-2 bg-white px-3 py-2 border border-slate-200 shadow-sm">
+            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Select Node:</span>
             {selectedId === 'node-1' && (
-              <div className={`h-2 w-2 rounded-full ${node1Connected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
+              <div className={`h-2.5 w-2.5 rounded-full ${node1Connected ? 'bg-green-500 animate-pulse' : 'bg-amber-500'}`} title={node1Connected ? 'Live ESP Connected' : 'Simulated / Standby'}></div>
             )}
             <select
               value={selectedId || ''}
               onChange={(e) => setSelectedId(e.target.value)}
-              className="appearance-none bg-transparent text-[11px] font-bold text-slate-600 uppercase tracking-wider pr-8 pl-1 cursor-pointer focus:outline-none"
+              className="bg-transparent text-xs font-bold text-slate-700 uppercase tracking-wider pr-8 pl-1 cursor-pointer focus:outline-none"
             >
-              {locations.filter(l => l.type === 'TEMP_NODE').map(loc => (
-                <option key={loc.id} value={loc.id} className="normal-case text-sm tracking-normal">
-                  {loc.name}{loc.id === 'node-1' && node1Connected ? ' (Connected)' : ''}
+              {allLocations.map(loc => (
+                <option key={loc.id} value={loc.id} className="normal-case text-sm font-medium">
+                  {loc.name} {loc.type === 'OFFICIAL' ? '(Official Base)' : loc.id === 'node-1' ? (node1Connected ? '• Live' : '• Standby') : ''}
                 </option>
               ))}
             </select>
             <div className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2">
-              <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" className="text-slate-400"><polyline points="6 9 12 15 18 9"></polyline></svg>
+              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className="text-slate-400"><polyline points="6 9 12 15 18 9"></polyline></svg>
             </div>
           </div>
         </div>
@@ -674,9 +597,13 @@ const App: React.FC = () => {
                       </span>
                       <h2 className="text-xl font-bold text-slate-900 leading-tight">{selectedLocation.name}</h2>
                     </div>
-                    <div className={`px-4 py-2 rounded-none text-center shadow-sm ${getAqiInfo(getCategoryFromAQI(selectedLocation.currentReading.aqi))?.color || 'bg-slate-400'} text-white`}>
-                      <div className="text-3xl font-bold leading-none">{selectedLocation.currentReading.aqi}</div>
-                      <div className="text-[9px] font-bold uppercase tracking-widest opacity-90 mt-1">AQI</div>
+                    <div className={`px-4 py-2 rounded-none text-center shadow-sm ${isNaN(selectedLocation.currentReading.aqi) ? 'bg-slate-400' : (getAqiInfo(getCategoryFromAQI(selectedLocation.currentReading.aqi))?.color || 'bg-slate-400')} text-white`}>
+                      <div className="text-3xl font-bold leading-none">
+                        {isNaN(selectedLocation.currentReading.aqi) ? '--' : selectedLocation.currentReading.aqi}
+                      </div>
+                      <div className="text-[9px] font-bold uppercase tracking-widest opacity-90 mt-1">
+                        {isNaN(selectedLocation.currentReading.aqi) ? 'OFFLINE' : 'AQI'}
+                      </div>
                     </div>
                   </div>
 
@@ -842,20 +769,8 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Bottom Section: Forecast then Map */}
+        {/* Bottom Section: Map View */}
         <div className="space-y-8">
-          {selectedLocation && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-700">
-              <PredictionModule
-                selectedId={selectedId}
-                nodeName={selectedLocation?.name}
-                sprinklerActive={selectedLocation.id === 'node-1' ? selectedLocation.currentReading.sprinklerActive : (sprinklerStatus.activeNodes && sprinklerStatus.activeNodes[selectedLocation.id])}
-                mockHistory={selectedLocation?.history}
-                currentAQI={selectedLocation.currentReading.aqi}
-              />
-            </div>
-          )}
-
           <div className="bg-white rounded-lg shadow-xl border border-slate-200 overflow-hidden">
             <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Live Map View</span>
